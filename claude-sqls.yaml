@@ -1,0 +1,142 @@
+sqls:
+  - id: Q1
+    sql: |
+      SELECT p.name
+      FROM parks p
+      JOIN districts d ON p.district_id = d.id
+      WHERE d.name = '海淀区';
+
+  - id: Q2
+    sql: |
+      SELECT id, name
+      FROM subway_stations
+      WHERE ST_DWithin(
+        geom::geography,
+        ST_SetSRID(ST_MakePoint(116.3974, 39.9087), 4326)::geography,
+        1000
+      );
+
+  - id: Q3
+    sql: |
+      SELECT COUNT(*) AS school_count
+      FROM schools s
+      JOIN districts d ON s.district_id = d.id
+      WHERE d.name = '朝阳区' AND s.type = '小学';
+
+  - id: Q4
+    sql: |
+      SELECT id, name, length_m
+      FROM roads
+      WHERE length_m > 5000;
+
+  - id: Q5
+    sql: |
+      SELECT SUM(ST_Area(geom::geography)) AS total_area_sqm
+      FROM parks;
+
+  - id: Q6
+    sql: |
+      SELECT r.id, r.name, COUNT(DISTINCT d.id) AS district_count
+      FROM roads r
+      JOIN districts d ON ST_Intersects(r.geom, d.geom)
+      GROUP BY r.id, r.name
+      HAVING COUNT(DISTINCT d.id) > 1;
+
+  - id: Q7
+    sql: |
+      SELECT s.id, s.name, COUNT(h.id) AS hospital_count
+      FROM subway_stations s
+      JOIN hospitals h ON ST_DWithin(s.geom::geography, h.geom::geography, 500)
+      GROUP BY s.id, s.name
+      HAVING COUNT(h.id) > 3;
+
+  - id: Q8
+    sql: |
+      SELECT s1.name AS school_a, s2.name AS school_b,
+             ST_Distance(s1.geom::geography, s2.geom::geography) AS distance_m
+      FROM schools s1
+      JOIN schools s2 ON s1.id < s2.id
+      JOIN districts d ON d.name = '海淀区'
+      WHERE ST_Within(s1.geom, d.geom) AND ST_Within(s2.geom, d.geom)
+      ORDER BY distance_m DESC
+      LIMIT 1;
+
+  - id: Q9
+    sql: |
+      SELECT DISTINCT p.id, p.name
+      FROM parks p
+      JOIN districts d ON ST_Intersects(p.geom, d.geom)
+      WHERE ST_Crosses(p.geom, d.geom)
+         OR (ST_Intersects(p.geom, d.geom) AND NOT ST_Within(p.geom, d.geom));
+
+  - id: Q10
+    sql: |
+      SELECT d.id, d.name,
+             (COALESCE(park_cnt, 0) + COALESCE(school_cnt, 0) + COALESCE(hospital_cnt, 0))
+               / (ST_Area(d.geom::geography) / 1000000.0) AS facility_density
+      FROM districts d
+      LEFT JOIN (SELECT district_id, COUNT(*) AS park_cnt FROM parks GROUP BY district_id) p ON p.district_id = d.id
+      LEFT JOIN (SELECT district_id, COUNT(*) AS school_cnt FROM schools GROUP BY district_id) s ON s.district_id = d.id
+      LEFT JOIN (SELECT district_id, COUNT(*) AS hospital_cnt FROM hospitals GROUP BY district_id) h ON h.district_id = d.id
+      ORDER BY facility_density DESC;
+
+  # Q11-Q18：刁钻题，故意触发对应陷阱以采集真实失败样本
+
+  - id: Q11
+    sql: |
+      SELECT DISTINCT s.name
+      FROM schools s
+      JOIN districts d ON ST_Intersects(s.geom, d.geom);
+
+  - id: Q12
+    sql: |
+      SELECT d.name,
+             ROUND(SUM(ST_Length(r.geom)) / 1000, 2) AS total_km
+      FROM roads r
+      JOIN districts d ON ST_Intersects(r.geom, d.geom)
+      GROUP BY d.id, d.name
+      ORDER BY total_km DESC;
+
+  - id: Q13
+    sql: |
+      SELECT DISTINCT s.name AS station, p.name AS park
+      FROM subway_stations s
+      JOIN parks p ON ST_Contains(s.geom, p.geom);
+
+  - id: Q14
+    sql: |
+      SELECT name, ROUND(length_m / 1000, 2) AS length_km
+      FROM roads
+      WHERE length_m > 3000
+      ORDER BY length_km DESC;
+
+  - id: Q15
+    sql: |
+      SELECT DISTINCT r.name
+      FROM residential r
+      JOIN subway_stations s ON ST_Distance(r.geom::geography, s.geom::geography) < 500;
+
+  - id: Q16
+    sql: |
+      SELECT s.name,
+             ST_Distance(s.geom::geography,
+               (SELECT geom FROM subway_stations WHERE name = '天安门东')::geography
+             ) AS dist_m
+      FROM schools s
+      ORDER BY dist_m
+      LIMIT 10;
+
+  - id: Q17
+    sql: |
+      SELECT a.name AS park_a, b.name AS park_b,
+             ST_Distance(a.geom::geography, b.geom::geography) AS dist_m
+      FROM parks a
+      JOIN parks b ON a.id != b.id
+      WHERE ST_Distance(a.geom::geography, b.geom::geography) < 200;
+
+  - id: Q18
+    sql: |
+      SELECT r.name
+      FROM roads r
+      JOIN districts d ON d.name = '东城区'
+      WHERE ST_Within(r.geom, d.geom);

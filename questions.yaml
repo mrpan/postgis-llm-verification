@@ -1,0 +1,279 @@
+# 18 个验证问题——覆盖 4 个真坑：
+# A. 空间索引利用（DWithin vs Distance）
+# B. 复杂空间关系（DE-9IM / Crosses / Overlaps / Touches）
+# C. 业务语义到表/字段的映射（"海淀"是哪张表的哪个字段）
+# D. 大数据量爆炸（多表 LEFT JOIN 笛卡尔积、无 LIMIT、无估算）
+
+questions:
+  # === Easy 5 题 ===
+
+  - id: Q1
+    level: easy
+    nl: 查询海淀区内所有公园的名称
+    traps: [C]
+    golden_sql: |
+      SELECT p.name
+      FROM parks p
+      JOIN districts d ON p.district_id = d.id
+      WHERE d.name = '海淀区';
+    eval_notes: |
+      可接受替代解：用 ST_Within(p.geom, d.geom) 替代 district_id 关联。
+      失败信号：硬编码 district_id；忽略 district_id 字段而强行做空间 join 损失性能。
+
+  - id: Q2
+    level: easy
+    nl: 找出距离天安门（经度 116.3974，纬度 39.9087）1 公里以内的地铁站
+    traps: [A]
+    golden_sql: |
+      SELECT name
+      FROM subway_stations
+      WHERE ST_DWithin(
+        geom::geography,
+        ST_SetSRID(ST_MakePoint(116.3974, 39.9087), 4326)::geography,
+        1000
+      );
+    eval_notes: |
+      关键考点：必须用 ST_DWithin 才走 GiST 索引。
+      失败信号：用 ST_Distance(...) < 1000；用 ST_Distance(geom, point) 不转 geography 单位错误。
+
+  - id: Q3
+    level: easy
+    nl: 北京市朝阳区有多少所小学
+    traps: [C]
+    golden_sql: |
+      SELECT COUNT(*)
+      FROM schools s
+      JOIN districts d ON s.district_id = d.id
+      WHERE d.name = '朝阳区' AND s.type = '小学';
+    eval_notes: |
+      考点：'小学' 是 schools.type 的字符串值，不是单独表。
+      失败信号：把"小学"当成单独表名；漏掉 type 过滤。
+
+  - id: Q4
+    level: easy
+    nl: 找出长度大于 5 公里的所有道路
+    traps: [A]
+    golden_sql: |
+      SELECT name, length_m
+      FROM roads
+      WHERE length_m > 5000;
+    eval_notes: |
+      可接受替代：WHERE ST_Length(geom::geography) > 5000（性能差但正确）。
+      最佳：使用预计算字段 length_m。
+      失败信号：ST_Length(geom) 不转 geography（度数单位）。
+
+  - id: Q5
+    level: easy
+    nl: 计算所有公园的总面积（以平方米为单位）
+    traps: [A]
+    golden_sql: |
+      SELECT SUM(ST_Area(geom::geography)) AS total_area_m2
+      FROM parks;
+    eval_notes: |
+      考点：必须 cast 为 geography 才能得到米单位。
+      失败信号：ST_Area(geom) 直接返回度数平方，结果错 4 个数量级。
+
+  # === Medium 3 题 ===
+
+  - id: Q6
+    level: medium
+    nl: 找出穿越多个行政区的道路
+    traps: [B]
+    golden_sql: |
+      SELECT r.name, COUNT(DISTINCT d.id) AS district_count
+      FROM roads r
+      JOIN districts d ON ST_Intersects(r.geom, d.geom)
+      GROUP BY r.id, r.name
+      HAVING COUNT(DISTINCT d.id) > 1;
+    eval_notes: |
+      考点：ST_Crosses 和 ST_Intersects 的区别——LineString 完全在 Polygon 内时 Crosses 为 false。
+      可接受：用 ST_Intersects + COUNT > 1 等价表达。
+      失败信号：只用 ST_Crosses 漏掉边界共享的道路。
+
+  - id: Q7
+    level: medium
+    nl: 哪些地铁站半径 500 米内有超过 3 家医院
+    traps: [A, D]
+    golden_sql: |
+      SELECT s.name, COUNT(h.id) AS hospital_count
+      FROM subway_stations s
+      JOIN hospitals h ON ST_DWithin(s.geom::geography, h.geom::geography, 500)
+      GROUP BY s.id, s.name
+      HAVING COUNT(h.id) > 3;
+    eval_notes: |
+      综合考点：ST_DWithin（不是 Distance）+ 空间 join 聚合。
+      失败信号：ST_Distance < 500 全表扫；忘记 GROUP BY。
+
+  - id: Q8
+    level: medium
+    nl: 海淀区内距离最远的两所学校
+    traps: [D]
+    golden_sql: |
+      SELECT s1.name, s2.name, ST_Distance(s1.geom::geography, s2.geom::geography) AS dist_m
+      FROM schools s1
+      JOIN schools s2 ON s1.id < s2.id
+      JOIN districts d ON s1.district_id = d.id AND s2.district_id = d.id
+      WHERE d.name = '海淀区'
+      ORDER BY dist_m DESC
+      LIMIT 1;
+    eval_notes: |
+      考点：CROSS JOIN 易爆炸——必须用 s1.id < s2.id 去重 + LIMIT 1。
+      失败信号：无 s1.id < s2.id 重复对；无 LIMIT。
+
+  # === Hard 2 题 ===
+
+  - id: Q9
+    level: hard
+    nl: 找出跨越行政区边界的公园（部分在某区内、部分在区外）
+    traps: [B]
+    golden_sql: |
+      SELECT DISTINCT p.name
+      FROM parks p
+      JOIN districts d ON ST_Overlaps(p.geom, d.geom);
+    eval_notes: |
+      关键考点：ST_Overlaps 严格定义——几何相交但任一方都不完全包含另一方且维度相同。
+      失败信号：用 ST_Intersects（包含完全包围的情况）；用 ST_Crosses（不适用 Polygon-Polygon）。
+
+  - id: Q10
+    level: hard
+    nl: 计算每个行政区的便民设施密度（公园+学校+医院总数 / 区面积平方公里），按密度倒序排列
+    traps: [D]
+    golden_sql: |
+      SELECT
+        d.name,
+        (
+          (SELECT COUNT(*) FROM parks WHERE district_id = d.id) +
+          (SELECT COUNT(*) FROM schools WHERE district_id = d.id) +
+          (SELECT COUNT(*) FROM hospitals WHERE district_id = d.id)
+        )::float
+        / (ST_Area(d.geom::geography) / 1000000) AS density_per_km2
+      FROM districts d
+      ORDER BY density_per_km2 DESC;
+    eval_notes: |
+      关键考点：避免多表 LEFT JOIN 笛卡尔积——用三个独立子查询。
+      典型失败：LEFT JOIN parks + LEFT JOIN schools + LEFT JOIN hospitals 然后 COUNT，
+      结果会被笛卡尔积放大成倍（3 个公园 × 5 学校 × 2 医院 = 30 而不是 10）。
+      失败信号：LEFT JOIN 三表 + COUNT(DISTINCT) 修补——COUNT(DISTINCT) 能修但慢且 LLM 经常漏。
+
+  # === 新增刁钻题（触发真实失败样本）===
+
+  - id: Q11
+    level: hard
+    nl: 找出所有恰好坐落在行政区边界上的学校（学校几何的边界点与某区边界重合）
+    traps: [B]
+    golden_sql: |
+      SELECT DISTINCT s.name
+      FROM schools s
+      JOIN districts d ON ST_Touches(s.geom, d.geom);
+    eval_notes: |
+      关键考点：ST_Touches 检测边界接触（点-面），ST_Intersects 会把"完全在区内"也包含。
+      Q9 的 Overlaps 问题变体：边界接触需要 Touches，不是 Intersects。
+      失败信号：用 ST_Intersects（包含区内部学校）；用 ST_Crosses（不适用 Point-Polygon）。
+
+  - id: Q12
+    level: hard
+    nl: 计算每个行政区内所有道路的总长度（以公里为单位）
+    traps: [A]
+    golden_sql: |
+      SELECT d.name,
+             ROUND((SUM(ST_Length(r.geom::geography)) / 1000)::numeric, 2) AS total_km
+      FROM roads r
+      JOIN districts d ON ST_Intersects(r.geom, d.geom)
+      GROUP BY d.id, d.name
+      ORDER BY total_km DESC;
+    eval_notes: |
+      关键考点：ST_Length 必须转 ::geography 才是米，否则是度数（错误 4 个数量级）。
+      失败信号：ST_Length(geom) 不带 cast；忘记除以 1000 转公里。
+
+  - id: Q13
+    level: hard
+    nl: 有哪些地铁站落在某个公园的范围内
+    traps: [B]
+    golden_sql: |
+      SELECT DISTINCT s.name AS station, p.name AS park
+      FROM subway_stations s
+      JOIN parks p ON ST_Within(s.geom, p.geom);
+    eval_notes: |
+      关键考点：Point-In-Polygon 用 ST_Within（点在面内），ST_Contains 反过来（面包含点）。
+      失败信号：用 ST_Intersects（会把"接触边界"也纳入）；用 ST_DWithin（只测距离，不测包含）。
+
+  - id: Q14
+    level: hard
+    nl: 找出长度超过 3 公里的所有道路（道路没有预计算 length_m 字段）
+    traps: [A]
+    golden_sql: |
+      SELECT name, ROUND((ST_Length(geom::geography) / 1000)::numeric, 2) AS length_km
+      FROM roads
+      WHERE ST_Length(geom::geography) > 3000
+      ORDER BY length_km DESC;
+    eval_notes: |
+      关键考点：无预计算字段时必须用 ST_Length(geom::geography)，不转是度数。
+      对比 Q4（有这个字段）：这题故意去掉预计算字段，看 LLM 是否理解需要 ::geography。
+      失败信号：ST_Length(geom) 不转 geography；把 Q4 答案（WHERE length_m > 3000）直接搬过来。
+
+  - id: Q15
+    level: hard
+    nl: 找出紧邻地铁站（500 米以内）但不在任何公园范围内的所有住宅区
+    traps: [A, B]
+    golden_sql: |
+      SELECT DISTINCT r.name
+      FROM residential r
+      WHERE EXISTS (
+        SELECT 1 FROM subway_stations s
+        WHERE ST_DWithin(s.geom::geography, r.geom::geography, 500)
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM parks p
+        WHERE ST_Within(r.geom, p.geom)
+      );
+    eval_notes: |
+      综合考点：ST_DWithin（距离判断）+ NOT EXISTS（排除）+ 嵌套子查询。
+      失败信号：漏掉 NOT EXISTS 导致住宅区被包含在公园里也算入；用 ST_Intersects 导致边界接触也算入。
+
+  - id: Q16
+    level: hard
+    nl: 找距离某地铁站最近的 2 所学校（返回学校名和距离米数），指定站点为"天安门东"
+    traps: [D, B]
+    golden_sql: |
+      SELECT s.name,
+             ST_Distance(s.geom::geography,
+               (SELECT geom FROM subway_stations WHERE name = '天安门东')::geography
+             ) AS dist_m
+      FROM schools s
+      ORDER BY dist_m
+      LIMIT 2;
+    eval_notes: |
+      关键考点：子查询标量获取指定站点坐标 + ORDER BY + LIMIT 限制。
+      失败信号：无 LIMIT 导致全表排序；忘记 ::geography 导致距离单位是度。
+
+  - id: Q17
+    level: hard
+    nl: 找出所有与其他公园相距不足 200 米的公园对（返回两公园名及距离）
+    traps: [D, A]
+    golden_sql: |
+      SELECT a.name AS park_a, b.name AS park_b,
+             ST_Distance(a.geom::geography, b.geom::geography) AS dist_m
+      FROM parks a
+      JOIN parks b ON a.id < b.id
+      WHERE ST_Distance(a.geom::geography, b.geom::geography) < 200;
+    eval_notes: |
+      关键考点：自我空间 JOIN 去重（a.id < b.id）+ ST_DWithin 或 ST_Distance 距离过滤。
+      失败信号：无 a.id < b.id 导致结果重复（每个对出现两次）；忘记 ::geography 单位错误。
+
+  - id: Q18
+    level: hard
+    nl: 用 ST_Relate 判断哪条道路完全被东城区包含（矩阵匹配 T*F**F***）
+    traps: [B]
+    golden_sql: |
+      SELECT r.name
+      FROM roads r
+      JOIN districts d ON d.name = '东城区'
+      WHERE ST_Relate(r.geom, d.geom, 'T*F**F***');
+    eval_notes: |
+      关键考点：DE-9IM 矩阵 T*F**F*** = ST_Within(road, district)：
+        pos 1 (I∩I)=T  道路内部与区内部相交（道路在区内）
+        pos 3 (I∩E)=F  道路内部不与区外相交（不越界）
+        pos 6 (B∩E)=F  道路端点不在区外（完全包含）
+        其余 * 不作约束
+      原 FF*FfFfFF 矩阵含义相反（"在区外"），且 f 不是有效 DE-9IM 字符。
+      失败信号：写不出 ST_Relate；用 ST_Within 直接替代（逻辑正确但没测 DE-9IM 能力）。
